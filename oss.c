@@ -93,7 +93,8 @@ void terminate();
 void process_child_requests(int k);
 void handle_page(int rw, int k, int r_adr, int p_adr);
 void handle_fault(int rw, int k, int r_adr, int p_adr);
-void FIFO_check(); 
+
+
 // Limit logfile from reaching more than 10k lines 
 int lfprintf(FILE *stream,const char *format, ... ) {
     static int lineCount = 0;
@@ -233,7 +234,7 @@ typedef struct FT {
 	memcpy(shm_ptr, shm_clock, sizeof(unsigned) * 2); 
 
 	// Set up message queues! 
-	key_t msgkey; 
+	key_t msgkey;
 
 	// Generating key for message queue
 	if ((msgkey = ftok("msgq.txt", 1)) == -1) { 
@@ -291,6 +292,7 @@ typedef struct FT {
 
 	// Cleaning up code to display memory statistics
 	terminate(); 
+	return 0; 
 } 
 
 void displayMemory() { 
@@ -423,17 +425,6 @@ void process_child_requests(int k) {
 		handle_fault(read_write_decision, k, child_req_adr, page_table_index); 
 	} 
 
-	FIFO_check(); 
-
-} 
-
-void FIFO_check() { 
-	// iterate the queue and get the first item
-    if (FIFO_queue[0] != -1)
-    {
-        // theres an item at the front of the queue
-        // todo
-    }
 } 
 
 // Function to handle when the page is in memory as opposed to not loaded 
@@ -575,7 +566,7 @@ struct FT frameTable[FRAME_SIZE];
 
 
 void help() { 
-	printf("This program is designed to simulate memory management:\n"); 
+	printf("This program is designed to implement a memory mangagement module. We'll be implementing the second-chance (CLOCK) page replacement algorithms.\n"); 
 	printf("[-h] - outputs a help message and terminates the program.\n");
 	printf("[-n proc] - specifies total number of child processes.\n");
 	printf("[-s simul] - specifies maximum number of child processes that can simultaneously run.\n");
@@ -603,7 +594,6 @@ void displayPCB() {
         printf("%-6d%-10d%-8d%-12u%-12u\n", i, processTable[i].occupied, processTable[i].pid, processTable[i].startSeconds, processTable[i].startNano);
     }
     printf("\n");
-
     fclose(fptr);
 }
 
