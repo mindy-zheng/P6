@@ -1,5 +1,5 @@
 // Name: Mindy Zheng
-// Date: 4/15/2024
+// Date: 5/1/2024 
 
 #include <unistd.h>
 #include <sys/ipc.h>
@@ -21,28 +21,25 @@
 #define SH_KEY 89918991
 #define PERMS 0644
 #define TWO_FIFTY_MS 250000000 // 250ms 
-#define ONEMS 1000000 // 1ms 
+#define ONEMS 1000000 // 1ms
 unsigned int shm_clock[2] = {0, 0};
 
 
-typedef struct msgbuffer { 
-	long mtype;                                                                 
-	int resourceAction;     // 0 means request, 1 means release
-    int resourceID;         // R0, R1, R2, etc..
-    pid_t targetPID;         // PID of child process that wants to release or                            request resources
+typedef struct msgbuffer {
+	long mtype;
+    int memory_address;
+    int opt_type;           // Option type: worker wants to read(1) or write(0)
+    int termination_flag; 
 } msgbuffer;
                                                                             msgbuffer buf;
 int msqid;
 
-int last_term = 0, last_check = 0, termination_req = 0; 
-
-// Amount of resources the child has of each resource type in the matrix 
-int current_resources[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-void childDecision(int x); 
-int checkState(); 
-
+int total_refs = 0; 
+void terminate_check(); 
+void exec_task(); 
 
 int main(int argc, char **argv) { 
+	
 	srand(time(NULL) + getpid()); 
 	// Set up message queue 
 	key_t msgkey = ftok("msgq.txt", 1);  
@@ -64,139 +61,59 @@ int main(int argc, char **argv) {
 			exit(1); 
 		} 
 	
-		// Check and wait to see if 1ms has passed, then we can send a message back 
-		while (1) { 
-			// Update clock in shared memory 
-			int shm_id = shmget(SH_KEY, sizeof(int) * 2, 0777); 
-			if (shm_id == -1) { 
-				perror("Failed to access shared memory in worker\n"); 
-				exit(EXIT_FAILURE);
-			} 
-		
-			int *shm_ptr = (int*)shmat(shm_id, NULL, SHM_RDONLY); 
-			if (shm_ptr == NULL) { 
-				perror("Failed to attach to shared memory in worker\n"); 
-				exit(EXIT_FAILURE); 
-			} 
-
-			// Update simulated clock time 
-			shm_clock[0] = shm_ptr[0]; // Seconds
-			shm_clock[1] = shm_ptr[1]; // Nanoseconds
-			shmdt(shm_ptr); 
-	
-			if (checkState() == 1) { 
-				int choice = rand() % 101; // Release or request a R
-				if (choice <= 10) {
-					// If the random number generated is less than 10%, set to release resource
-					childDecision(1);   
-				} else {
-					// If the random number is greater than 10, set to request 
-					childDecision(0); 
-				}
-				break; 
-			}
-
+		// Update clock in shared memory 
+		int shm_id = shmget(SH_KEY, sizeof(int) * 2, 0777); 
+		if (shm_id == -1) { 
+			perror("Failed to access shared memory in worker\n"); 
+			exit(EXIT_FAILURE);
 		} 
-	}
-} 
-void childDecision(int resourceAction) {
-	if (resourceAction == 1) {
-	// Check if there are resources the child can release
-    // Initialize an array to hold releasable resources
-    	int resourceToRelease[10];
-        int releaseableResourceCount = 0;
-        for (int i = 10; i < 10; i++) {
-        // If the child currently has any resource of i, then add i to the list
-  	      if (current_resources[i] != 0) {
-  	        resourceToRelease[releaseableResourceCount] = i;
-            releaseableResourceCount++; 
-          }
-    	}
+		
+		int *shm_ptr = (int*)shmat(shm_id, NULL, SHM_RDONLY); 
+		if (shm_ptr == NULL) { 
+			perror("Failed to attach to shared memory in worker\n"); 
+			exit(EXIT_FAILURE); 
+		} 
 
-        if (releaseableResourceCount == 0) {
-           // If the child process doesn't have any resources to release, request a resource instead
-     	   buf.resourceAction = 0;
-           buf.resourceID = rand() % 10; // Choose random resource type
-        } else {
-           // If child has resources to release, choose a random resource from list of releasable resources
-           int rand_resource = resourceToRelease[rand() % releaseableResourceCount];
-           buf.resourceID = rand_resource;
-           buf.resourceAction = resourceAction;
-        }
-	} else {
-   	// If 0, the child wants to request a resource
-    	int resourceToRequest[10];
-        int requestResourceCount = 0;
-        for (int i = 0; i < 10; i++) {
-            // If child doesn't have the max amount of resource i, add i to the requestable resources                
-			 if (current_resources[i] != 20) {
-			 	resourceToRequest[requestResourceCount] = i;
-                requestResourceCount += 1;
-             }
-        }
+		// Update simulated clock time 
+		shm_clock[0] = shm_ptr[0]; // Seconds
+		shm_clock[1] = shm_ptr[1]; // Nanoseconds
+		shmdt(shm_ptr);
+	
+		// Default behavior is to not terminate unless said to. 
+		buf.termination_flag = 0; 
+		// At every 1000 memory references, the user will check whether it should terminate. 
+		if (total_refs % 1000 == 0) { 
+			if (total_refs != 0) { 
+				// Give it 25% chance of terminating
+				int rand_term = rand() % 101; 
+				if (rand_term <= 25) { 
+					// Store termination message to send to parent
+					buf.termination_flag = 1; 
+				}
+			}
+		}
+		
+		int memory_adr = rand() % 64001; 
+		int read_write_decision = rand() % 101; 
+		
+		if (read_write_decision <= 25) { 
+			// Parent will send a write message to parent if less or equal to 25 
+			buf.opt_type = 1; // 25 percent chance of writing 
+		} else { 
+			buf.opt_type = 0; // 75 percent chance of reading 
+		} 
+		total_refs += 1; 
+		buf.mtype = getppid(); 
+		buf.memory_address = memory_adr; 
 
-        // If the child process can't request any resources, it will release resource instead
-        if (requestResourceCount == 0) {
-        	buf.resourceAction = 1;
-            buf.resourceID = rand() % 10;
-        } else {
-         // if the child can request, choose a random resource
-            int rand_resource = resourceToRequest[rand() % requestResourceCount];
-            buf.resourceID = rand_resource; 
-            buf.resourceAction = resourceAction;
+		if (msgsnd(msqid, &buf, sizeof(msgbuffer) - sizeof(long), 0) == -1) {
+            perror("msgsnd to parent failed\n");
+            exit(1);
+        }
+		// Terminate the child after sending the message 
+		if (buf.termination_flag == 1) { 
+			exit(0); 
 		}
 	}
-            // Send message to parent process with child PID, the resource type, and whether child wants to request or release
-    buf.mtype = getppid();
-    buf.targetPID = getpid();
-    if (msgsnd(msqid, &buf, sizeof(msgbuffer) - sizeof(long), 0) == -1) { 
-		perror("msgsnd to parent failed\n");
-        exit(1);
-    }
-
-    // wait for the message back
-    msgbuffer recievedmsg;
-    if (msgrcv(msqid, &recievedmsg, sizeof(msgbuffer), getpid(), -0) == -1) {
-	    perror("Couldn't recieve message back from parent in worker\n");
-        exit(1);
-    }
-
-    // Update child's current resources based on decision. If the child request a resource and parent approves, increment the count of that resource
-    // If the child released resource, decrement
-    if (buf.resourceAction == 0) {
-    	current_resources[buf.resourceID] += 1;
-    } else {
-    	current_resources[buf.resourceID] -= 1;
-	}
-}
-
-int checkState() { 
-	// Check if 250ms has initially passed; if so, set the termination req to 1 
-	if (shm_clock[1] >= TWO_FIFTY_MS && termination_req == 0) { 
-		termination_req = 1; 
-	} 
-	
-	// If the termination requirement time is 1 and either 250 ms has passed since the last termination check or 1s has passed overall, termination becomes a likliehood
-	if (termination_req == 1 && ((shm_clock[1] >= last_term + TWO_FIFTY_MS) || (shm_clock[1] == 0 && shm_clock[0] >= 1 ))) { 
-		// Generate a random number between 0 and 100. If the number is less than or equal to 10, terminate the process (10% chance)  
-		int rand_term = rand() % 101; 
-		if (rand_term <= 10) { 
-			exit(0); 
-		} 
-		// Update last termination check 
-		last_term = shm_clock[1]; 
-	} 
-
-	// Check if 1ms has passed since the last check, or if 1s has passed. If so, take action and send a request or release to the parent process 
-	int current_clock = shm_clock[1]; // Store current value to reduce repeated access
-	if (current_clock >= last_check + ONEMS || (current_clock == 0 && shm_clock[0] >= 1)) { 
-		last_check = current_clock; // Update and return 1 that a decision can be made
-		return 1; 
-	} 
-
-	// If none of the conditions are met; state remains 
 	return 0; 
-} 
-
-
-
+}

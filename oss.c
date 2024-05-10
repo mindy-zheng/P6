@@ -16,6 +16,8 @@
 #include <sys/msg.h>
 #include <errno.h>
 #include <stdarg.h> 
+#include <limits.h> 
+#include <stdint.h> 
 
 void help(); 
 
@@ -28,7 +30,7 @@ unsigned int shm_clock[2] = {0, 0}; // Creating simulated clock in shared memory
 #define HALF_NANO 5000000000	// Condition for printing the process table; half a nano
 #define ONE_SEC 1000000000	// 1,000,000,000 (billion) nanoseconds is equal to 1 second
 #define NANO_INCR 100000	// 0.1 millisecond 
-#define FRAME_SIZE 256 	// 
+#define FRAME_SIZE 256 	// require a frame table of 256 structures  
 int total_launched = 0, total_terminated = 0, second_passed = 0, half_passed = 0;
 unsigned long long launch_passed = 0;  
 
@@ -38,40 +40,60 @@ typedef struct PCB {
 	pid_t pid; 			// Process ID of current assigned child 
 	int startSeconds; 	// Start seconds when it was forked
 	int startNano; 		// Start nano when it was forked
-	int awaitingResponse; 	// Process waiting response 
+	int pages[64];		// Page table requiring 64 entries
+	int childMemoryRefs; 	// memory references made by child process
+	int targetPage;			// the page table index that the process wants to req in
+	int isBlocked;			// Process is blocked and in queue 
+	int isRequestAtFront; 	// indicates whether the process has a request at the front of the queue  
 } PCB; 
+
 struct PCB processTable[18];
-void deadlock_detection();
+
+// Frame Table Structure
+typedef struct FT { 
+	int dirtyBit;		// Indicates whether the frame has been written to 
+	int pageOccupied; 	// Which page is in this frame 
+	pid_t pageID; 		
+	int headOfQueue; 	// Indicates whether frame is at the head of the FIFO queue 
+} FT;
+
+struct FT frameTable[FRAME_SIZE]; 
 
 void displayPCB(); 
+void displayMemory(); 
+
+// FIFO queues
+int FIFO_queue[18]; 
+// Saves the time for requests
+unsigned int front_queue_time[2] = {0, 0}; 
 
 // Message Queue Structure 
 typedef struct msgbuffer { 
-	long mtype; 
-	int resourceAction; 	// 0 means request, 1 means release
-	int resourceID; 		// R0, R1, R2, etc.. 
-	pid_t targetPID; 		// PID of child process that wants to release or 							request resources 
+	long mtype;
+	int memory_address;	
+	int opt_type;			// Option type: worker wants to read(1) or write(0) 
+	int termination_flag; 
 } msgbuffer;
 
 msgbuffer buf; 
 int msqid; 
+
 unsigned shm_id;
 unsigned *shm_ptr; 
 
+// Process statistics variables 
+int total_refs = 0; // Total number of memory references made 
+int total_page = 0; // Total number of page faults 
 
-// Resource and allocation tables 
-int allocatedMatrix[10][18]; 
-int requestMatrix[10][18]; 
-int allResources[10]; 
-
-void displayResources(); 
 	
 static void myhandler(int);
 static int setupinterrupt(void);
 static int setupitimer(void);
-void terminate(); 
-void dispatch_message(int i); 
-
+void terminate();
+void process_child_requests(int k);
+void handle_page(int rw, int k, int r_adr, int p_adr);
+void handle_fault(int rw, int k, int r_adr, int p_adr);
+void FIFO_check(); 
 // Limit logfile from reaching more than 10k lines 
 int lfprintf(FILE *stream,const char *format, ... ) {
     static int lineCount = 0;
@@ -88,9 +110,8 @@ int lfprintf(FILE *stream,const char *format, ... ) {
     return 0;
 }
 
-void incrementClock() {
-	int incrementNano = NANO_INCR;
-	shm_clock[1] += incrementNano;  
+void incrementClock(int nanoseconds) {
+	shm_clock[1] += nanoseconds;  
 
 	if (shm_clock[1] >= ONE_SEC) { 
 		unsigned incrementSec = shm_clock[1] / ONE_SEC; 
@@ -154,27 +175,48 @@ int main(int argc, char **argv) {
 				exit(EXIT_FAILURE);
 		} 
 	}
+	// Create msgq file 
+	system("touch msgq.txt");
 	
 	// Initializing PCB table: 
 	for (int i = 0; i < 18; i++) { 
 		processTable[i].occupied = 0;
 		processTable[i].pid = 0; 
 		processTable[i].startSeconds = 0; 
-		processTable[i].startNano = 0; 
-		processTable[i].awaitingResponse = 0; 
-	} 
-
-	// Set up Resource Matrix
-	for (int i = 0; i < 10; i++) { 
-		for (int j = 0; j < 18; j++) { 
-			allocatedMatrix[i][j] = 0; 
-			requestMatrix[i][j] = 0; 
+		processTable[i].startNano = 0;
+		processTable[i].isBlocked = 0; 
+		processTable[i].isRequestAtFront = 0; 
+		processTable[i].childMemoryRefs = 0; 
+		processTable[i].targetPage = INT16_MIN; // Minimum value
+		
+		// Initialize the process page table:  
+		for (int k = 0; k < 64; k++) { 
+			// Set it to be a negative number 
+			processTable[i].pages[k] = INT16_MIN;
 		}
 	} 
-	
-	for (int i = 0; i < 10; i++) { 
-		allResources[i] = 0; 
-	} 
+
+	/* Frame Table Structure
+typedef struct FT {
+    int dirtyBit;       // Indicates whether the frame has been written to
+    int pageOccupied;   // Which page is in this frame
+    pid_t pageID;
+    int headOfQueue;    // Indicates whether frame is at the head of the FIFO queue
+} FT; */ 
+
+	// Initialize the frame table 
+	for (int i = 0; i < FRAME_SIZE; i++) { 
+		frameTable[i].pageOccupied = -1; 
+		frameTable[i].pageID = -1; 
+		frameTable[i].dirtyBit = 0; 
+		frameTable[i].headOfQueue = -1; 
+	}
+
+	// If the queue has negative values, then a page isn't in that spot. 
+	for (int j = 0; j < 18; j++) { 
+		FIFO_queue[j] = INT16_MIN; 
+	}  
+
 
 	// Set up shared memory channels! 
 	shm_id = shmget(SH_KEY, sizeof(unsigned) * 2, 0777 | IPC_CREAT); 
@@ -191,7 +233,6 @@ int main(int argc, char **argv) {
 	memcpy(shm_ptr, shm_clock, sizeof(unsigned) * 2); 
 
 	// Set up message queues! 
-	system("touch msgq.txt");
 	key_t msgkey; 
 
 	// Generating key for message queue
@@ -208,7 +249,7 @@ int main(int argc, char **argv) {
 
 	while (total_terminated != proc) { 
 		launch_passed += NANO_INCR; 
-		incrementClock(); 
+		incrementClock(launch_passed); 
 	
 		// Calculate if we should launch child 
 		if (launch_passed >= interval || total_launched == 0) { 
@@ -220,7 +261,6 @@ int main(int argc, char **argv) {
 				} else {
 					processTable[total_launched].pid = pid; 
 					processTable[total_launched].occupied = 1;
-					processTable[total_launched].awaitingResponse = 0; 
 					processTable[total_launched].startSeconds = shm_clock[0]; 
 					processTable[total_launched].startNano = shm_clock[1]; 
 				} 
@@ -230,343 +270,319 @@ int main(int argc, char **argv) {
 			launch_passed = 0; 
 		} 
 
-		// Check if any processes have terminated 
-		for (int i = 0; i < total_launched; i++) { 
-			int status; 
-			pid_t childPid = processTable[i].pid; 
-			pid_t result = waitpid(childPid, &status, WNOHANG); 
-			if (result > 0) {
-				FILE* fptr = fopen(filename, "a+"); 
-				if (fptr == NULL) { 
-					perror("Error opening file"); 
-					exit(1); 
-				} 
- 
-				char *detection_message = "\nMaster detected process P%d terminated\n"; 
-				lfprintf(fptr, detection_message, i); 
-				printf(detection_message, i); 
-
-				// Release Resources if child has terminated 
-				lfprintf(fptr, "Releasing Resources: "); 
-				printf("Releasing Resources: "); 
-
-				for (int t = 0; t < 10; t++) { 
-					if (allocatedMatrix[t][i] != 0) { 
-						allResources[t] -= allocatedMatrix[t][i]; 
-						lfprintf(fptr, "R%d: %d ", t, allocatedMatrix[t][i]); 
-						printf("R%d: %d ", t, allocatedMatrix[t][i]); 
-					} 
-					requestMatrix[t][i] = 0; 
-					allocatedMatrix[t][i] = 0; 
-				} 
-				lfprintf(fptr, "\n"); 
-				printf("\n"); 
-				processTable[i].occupied = 0; 
-				processTable[i].awaitingResponse = 0; 
-				total_terminated += 1; 
-				fclose(fptr); 
-			}
-		} 
-		
 		if (proc == total_terminated) { 
 			terminate(); 
 		} 
 
-		// Check message from children 
-		msgbuffer msg; 
-		if (msgrcv(msqid, &msg, sizeof(msgbuffer), getpid(), IPC_NOWAIT) == -1) { 
-			if (errno == ENOMSG) { 
-				// Loops.. printf("Got no message, so maybe do nothing\n"); 
-			} else { 
-				printf("Got an error message from msgrcv\n"); 
-				perror("msgrcv"); 
-				terminate(); 
+		for (int k = 0; k < total_launched; k++) { 
+		// Check message and send messages to the child processes  
+			if (processTable[k].occupied == 1 && processTable[k].isBlocked == 0) { 
+				process_child_requests(k); 
 			} 
-		} else {
-			// printf("Recived %d from worker\n",message.data);
-			int targetPID = -1; 
-			pid_t messenger = msg.targetPID; 
-			
-			for (int i = 0; i < proc; i++) { 
-				if (processTable[i].pid == messenger) { 
-					targetPID = i; 
-				} 
-			} 
-
-			// Check the content of the msg 
-			int sendmsg = 0; 
-			if (msg.resourceAction == 1) { 
-				FILE* fptr = fopen(filename, "a+"); 
-				if (fptr == NULL) { 
-					perror("Error opening and appending to file\n"); 
-					terminate(); 
-				} 
-			
-				char *acknowledged_message = "Master has acknowledged Process P%d releasing R%d at time %u:%u\n\n"; 
-				lfprintf(fptr, acknowledged_message, targetPID, msg.resourceID, shm_clock[0], shm_clock[1]); 
-				printf(acknowledged_message, targetPID, msg.resourceID, shm_clock[0], shm_clock[1]); 
-
-				// Child is releasing instance of resource
-				allResources[msg.resourceID] -= 1; 
-				allocatedMatrix[msg.resourceID][targetPID] -= 1; 
-				sendmsg = 1;  
-				fclose(fptr); 
-			} else { 
-				FILE* fptr = fopen(filename, "a+"); 
-				if (fptr == NULL) { 
-					perror("Error opening and appending to file"); 
-					terminate(); 
-				} 
-				
-				char *detected_req_message = "\nMaster has detected Process P%d request R%d at time %u:%u:\n"; 
-				lfprintf(fptr, detected_req_message, targetPID, msg.resourceID, shm_clock[0], shm_clock[1]); 
-				printf(detected_req_message, targetPID, msg.resourceID, shm_clock[0], shm_clock[1]);
-				
-				// Child requesting a resource 
-				if (allResources[msg.resourceID] != 20) { 
-					char *grant_message = "Master granting P%d request R%d at time %u:%u\n";
-					lfprintf(fptr, grant_message, targetPID, msg.resourceID, shm_clock[0], shm_clock[1]);
-					printf(grant_message, targetPID, msg.resourceID, shm_clock[0], shm_clock[1]);
-					allResources[msg.resourceID] += 1; 
-					allocatedMatrix[msg.resourceID][targetPID] += 1; 
-					sendmsg = 1; 
-				} else { 
-				// If the child resource cannot be granted, put them in the wait queue 
-					char *resource_unavailable = "Master: no instances of R%d are available, P%d added to wait queue at time %u:%u\n\n"; 
-					lfprintf(fptr, resource_unavailable, targetPID, msg.resourceID, shm_clock[0], shm_clock[1]);
-					printf(resource_unavailable, targetPID, msg.resourceID, shm_clock[0], shm_clock[1]);
-					requestMatrix[msg.resourceID][targetPID] = 1; 
-				}
-
-				fclose(fptr); 
-			}
-			
-			// Send confirmation message 
-			if (sendmsg == 1) { 
-				buf.mtype = processTable[targetPID].pid; 
-				processTable[targetPID].awaitingResponse = 0; 
-			
-				if (msgsnd(msqid, &buf, sizeof(msgbuffer) - sizeof(long), 0) == -1) { 
-					perror("msgsnd to child failed \n"); 
-					terminate(); 
-				}
-			}
-		}
-
-		// End of sending message back to the children 
-
-		for (int i = 0; i < total_launched; i++) { 
-			if (processTable[i].occupied == 1) { 
-				if (processTable[i].awaitingResponse == 0) { 
-					// Update the awaiting response flag for child process 
-					dispatch_message(i); 
-				}
-			}
 		} 
 
-		// If current seconds is at least one second or later than one in shared memory 
-		if (shm_clock[0] >= second_passed + 1) { 
-			// Run deadlock detection 
-			deadlock_detection(); 
-		} 
-		// Show all resource and process tables 
-		if (shm_clock[0] >= half_passed + HALF_NANO || (shm_clock[1] == 0 && shm_clock[0] > 1)) { 
-			displayPCB();
-			displayResources(); 
+		// Show all tables we have
+		if (shm_clock[1] >= half_passed + HALF_NANO || (shm_clock[1] == 0 && shm_clock[0] > 1)) { 
+			displayPCB(); 
+			displayMemory(); 
 			half_passed = shm_clock[1]; 
-		}
+		} 
+	} 
 
-	}
-
+	// Cleaning up code to display memory statistics
 	terminate(); 
+} 
 
-	return 0; 
+void displayMemory() { 
+	FILE *fptr = fopen(filename, "a+"); 
+	if (fptr == NULL) { 
+		perror("Error opening the file"); 
+		terminate(); 
+	} 
+
+	// Print the page table info 
+	lfprintf(fptr, "\n"); 
+	printf("\n"); 
+	
+	lfprintf(fptr, "%-8s%-8s", "", "\t\t\t\t\t Page Table Entries: \n"); 
+	printf("%-8s%-8s", "", "\t\t\t\t\t Page Table Entries: \n");
+	
+	for (int i = 0; i < 64; ++i) { 
+		if (i == 0) { 
+			printf("P %-6s", " "); 
+			lfprintf(fptr, "P %-6s", " ");
+		} 
+		printf("%-4d", i); 
+		lfprintf(fptr, "%-4d", i); 
+	} 
+	
+	lfprintf(fptr, "\n"); 
+	printf("\n"); 
+	lfprintf(fptr, "\n"); 
+	printf("\n"); 
+
+	for (int i = 0; i < total_launched; i++) { 
+		if (processTable[i].occupied == 1) { 
+			// Print pages for child process 
+			lfprintf(fptr, "%-8d", i);
+			printf("%-8d", i); 
+			for (int j = 0; j < 64; ++j) { 
+				// Print empty space if page isn't in frame table: 
+				if (processTable[i].pages[j] < 0) { 
+					lfprintf(fptr, "%-4s", "*"); 
+					printf("%-4s", "*");
+				} else { 
+				// There is indeed a value in the frame table 
+					lfprintf(fptr, "%-4d", processTable[i].pages[j]);
+					printf("%-4d", processTable[i].pages[j]); 
+				} 
+			}
+			lfprintf(fptr, "\n"); 
+			printf("\n"); 
+		} 
+	}
+	lfprintf(fptr, "\n"); 
+	printf("\n"); 
+	
+	// Print which processes have a page 
+	lfprintf(fptr, "\n");
+    printf("\n");
+	lfprintf(fptr, "%-13s%-15s%-15s%-15s\n", "Occupied", "Dirty Bit", "SecondChance", "NextFrame");
+	printf("%-13s%-15s%-15s%-15s\n", "Occupied", "Dirty Bit", "SecondChance", "NextFrame");
+
+	for (int i = 0; i < FRAME_SIZE; ++i) { 
+		struct FT currentFrame = frameTable[i]; 
+		if (currentFrame.headOfQueue == 1) { 
+			lfprintf(fptr, "%-13d%-15d%-15d%-15s\n", i, currentFrame.pageOccupied, currentFrame.dirtyBit, "*"); 
+			printf("%-13d%-15d%-15d%-15s\n", i, currentFrame.pageOccupied, currentFrame.dirtyBit, "*");
+		} else { 
+			lfprintf(fptr, "%-13d%-15d%-15d%-15s\n", i, currentFrame.pageOccupied, currentFrame.dirtyBit, "");
+            printf("%-13d%-15d%-15d%-15s\n", i, currentFrame.pageOccupied, currentFrame.dirtyBit, "");
+		}
+	}
+	lfprintf(fptr, "\n"); 
+	printf("\n"); 
+	fclose(fptr); 
+}
+
+void process_child_requests(int k) { 
+	// Send a messsage to the child process 
+	buf.mtype = processTable[k].pid; 
+	if (msgsnd(msqid, &buf, sizeof(msgbuffer)-sizeof(long), IPC_NOWAIT) == -1) { 
+		fprintf(stderr, "Error, msgsnd to worker failed\n"); 
+		exit(EXIT_FAILURE);
+	} 
+
+	// After sending essage to the child, check what address and whether it's read or write. 
+	msgbuffer msg; 
+	if (msgrcv(msqid, &msg, sizeof(msgbuffer), getpid(), 0) == -1) { 
+		fprintf(stderr, "Error, msgrcv to parent failed\n"); 
+		exit(EXIT_FAILURE);
+	} 
+	
+	// Log info about the requests
+	FILE* fptr = fopen(filename, "a+"); 
+	if (fptr == NULL) { 
+		perror("Error opening file"); 
+		terminate(); 
+	}
+	
+	// first periodic check if termination 
+	if (msg.termination_flag == 1) { 
+		// Clear resources b/c child wants to terminate 
+		char* termination_msg = "OSS: detected P%d terminated at time: %u: %u\n"; 
+		lfprintf(fptr, termination_msg, k, shm_clock[0], shm_clock[1]); 
+		printf(termination_msg, k, shm_clock[0], shm_clock[1]);
+		
+		// Statistics regarding final memory reference 
+		char* mem_ref = "OSS: Process P%d had %d total memory references before termination\n";
+		lfprintf(fptr, mem_ref, k, processTable[k].childMemoryRefs); 
+		printf(mem_ref, k, processTable[k].childMemoryRefs);
+		// Update process table and terminatino count 
+		processTable[k].occupied = 0; 
+		processTable[k].isBlocked = 0; 
+		total_terminated += 1; 
+		fclose(fptr); 
+		return; 
+	} 
+		
+	fclose(fptr); 
+	// Fetch requested memory addr and optin to read or write
+
+	int read_write_decision = msg.opt_type; // Read(1), write(0) 
+	int child_req_adr = msg.memory_address; 
+	
+	// Calculate page that the child requests 
+	int page_table_index = (int)child_req_adr/1024; 
+	
+	// Determine if the request can be fufilled. If the page is in mem, and if we can store it in our frame table, or if frame table is empty. Handle wanting to write or read of memory address 
+	if (processTable[k].pages[page_table_index] >= 0) { 
+		// Requested cild page is already loaded into memory. 
+		handle_page(read_write_decision, k, child_req_adr, page_table_index); 
+	} else { 
+		handle_fault(read_write_decision, k, child_req_adr, page_table_index); 
+	} 
+
+	FIFO_check(); 
 
 } 
 
+void FIFO_check() { 
+	// iterate the queue and get the first item
+    if (FIFO_queue[0] != -1)
+    {
+        // theres an item at the front of the queue
+        // todo
+    }
+} 
+
+// Function to handle when the page is in memory as opposed to not loaded 
+void handle_page(int read_or_write, int i, int req_adr, int page_adr) { 
+	FILE* fptr = fopen(filename, "a+");
+    if (fptr == NULL) {
+    	perror("Error opening and appending to file");
+        terminate();
+    }
+		
+	if (read_or_write == 0) { 
+   		// Requesting read
+        char* read_req_msg = "\nOSS: P%d requesting read of address %d at time %u:%u\n\n";
+       	lfprintf(fptr, read_req_msg, i, req_adr, shm_clock[0], shm_clock[1]); 
+		printf(read_req_msg, i, req_adr, shm_clock[0], shm_clock[1]); 
+
+		char* read_msg = "\nOSS: Indicating to P%d that read at address %d has happened at address %d";
+		lfprintf(fptr, read_msg, i, req_adr);
+		printf(read_msg, i, req_adr);
+	} else { 
+		// Requesting write
+		char* write_req_msg = "\nOSS: P%d requesting write of address %d at time %u:%u\n\n";	
+		lfprintf(fptr, write_req_msg, i, req_adr, shm_clock[0], shm_clock[1]);
+		printf(write_req_msg, i, req_adr, shm_clock[0], shm_clock[1]);
+		
+		char* write_msg = "\nOSS: Indicating to P%d that write has happened to address %d";
+		lfprintf(fptr, write_msg, i, req_adr); 
+        printf(write_req_msg, i, req_adr);
+
+		// Update dirty bit and print message if the dirty bit is set to 0, the frame hasn't been written to. 
+		int frame_index = processTable[i].pages[page_adr]; 
+		if (frameTable[frame_index].dirtyBit == 0) { 
+			frameTable[frame_index].dirtyBit == 1; 
+			// Increment clock by - NANO_INCR 100000
+			incrementClock(NANO_INCR);
+			
+			char *dirty_bit_msg = "OSS: Dirty bit of frame %d set, adding additional time to clock at %u:%u\n"; 
+			lfprintf(fptr, dirty_bit_msg, frame_index, shm_clock[0], shm_clock[1]); 
+			printf(dirty_bit_msg, frame_index, shm_clock[0], shm_clock[1]);
+		}
+	}
+		
+	// Update clock normally 
+	incrementClock(NANO_INCR); 
+	processTable[i].childMemoryRefs += 1; 
+	total_refs += 1; 
+	fclose(fptr); 
+}
+
+// Function to handle a page not being in memory 
+void handle_fault(int read_or_write, int i, int req_adr, int page_adr) {		
+	FILE* fptr = fopen(filename, "a+");
+    if (fptr == NULL) {
+        perror("Error opening and appending to file");
+        terminate();
+    }
+	
+	if (read_or_write == 0) { 
+		char* read_req_msg = "\nOSS: P%d requesting read of address %d at time %u:%u\n\n";
+		lfprintf(fptr, read_req_msg, i, req_adr, shm_clock[0], shm_clock[1]); 		printf(read_req_msg, i, req_adr, shm_clock[0], shm_clock[1]);
+
+	} else {
+		char* write_req_msg = "\nOSS: P%d requesting write of address %d at time %u:%u\n\n"; 
+		lfprintf(fptr, write_req_msg, i, req_adr, shm_clock[0], shm_clock[1]);
+		printf(write_req_msg, i, req_adr, shm_clock[0], shm_clock[1]);
+	} 
+
+	// Find the next available frame that's not in memory. we'll find a page if there are any empty ones. 
+	for (int k = 0; k < 256; k++) { 
+		struct FT currentFrame = frameTable[k]; 
+		if (currentFrame.pageOccupied == -1) {
+			char* write_req_msg = "\nOSS: P%d requesting write of address %d at time %u:%u\n\n"; 
+			lfprintf(fptr, write_req_msg, i, req_adr, shm_clock[0], shm_clock[1]);
+			printf(write_req_msg, i, req_adr, shm_clock[0], shm_clock[1]);
+			
+			char* page_fault = "\n OSS: Address %d is not in a frame, page fault"; 
+			lfprintf(fptr, page_fault, req_adr); 
+			printf(page_fault, req_adr);  
+
+			// Setting dirty bit to 1 since this is a new frame 
+			currentFrame.dirtyBit = 1; 
+			incrementClock(NANO_INCR); 
+			
+			char* dirty_bit_msg = "\nOSS: Dirty bit of frame %d was set, adding additional time to the clock"; 
+			lfprintf(fptr, dirty_bit_msg, k); 
+			printf(dirty_bit_msg, k); 
+
+			// Store the page that will occupy the frame 
+			currentFrame.pageOccupied = page_adr; 
+			currentFrame.pageID = processTable[i].pid; 
+			
+			// Update page table whose page is added to the frame table 
+			processTable[i].pages[page_adr] = k; 
+			processTable[i].childMemoryRefs += 1; 
+		
+			// Print frame table updates. 
+			if (read_or_write == 0) {
+				char* read_msg = "\nOSS: Indicating to P%d that read at address %d has happened at address %d"; 
+				// Read Success message
+				lfprintf(fptr, read_msg, i, req_adr); 
+				printf(read_msg, i, req_adr); 
+			} else {
+				char* write_msg = "\nOSS: Indicating to P%d that write has happened to address %d"; 
+				// Write success message
+				lfprintf(fptr, write_msg, i, req_adr); 
+				printf(write_msg, i, req_adr);
+			} 
+			// Update final statistics
+			total_refs += 1; 
+			total_page += 1; 
+			return; 
+		}
+	}
+	// Update statistics of memory usage
+	total_refs += 1; 
+	total_page += 1; // Update page faults since not in memory
+	incrementClock(NANO_INCR); 
+	fclose(fptr); 
+} 
+
+/*// Message Queue Structure
+typedef struct msgbuffer {
+    long mtype;
+    int memory_address;
+    int opt_type;           // Option type: worker wants to read(1) or write(0)
+    int termination_flag;
+} msgbuffer; */ 
+
+/* Frame Table Structure
+typedef struct FT {
+    int dirtyBit;       // Indicates whether the frame has been written to
+    int pageOccupied;   // Which page is in this frame
+    pid_t pageID;
+    int headOfQueue;    // Indicates whether frame is at the head of the FIFO queue
+} FT;
+
+struct FT frameTable[FRAME_SIZE];
+*/ 
+
+
 void help() { 
-	printf("This program is designed to simulate resource management inside of an operating system. It will primarily manage resources and take care of any possible deadlock issues :\n"); 
+	printf("This program is designed to simulate memory management:\n"); 
 	printf("[-h] - outputs a help message and terminates the program.\n");
 	printf("[-n proc] - specifies total number of child processes.\n");
 	printf("[-s simul] - specifies maximum number of child processes that can simultaneously run.\n");
 	printf("[-i intervalInMsToLaunchChildren] - specifies how often a children should be launched based on sys clock in milliseconds\n"); 
 	printf("[-f logfile] - outputs log to a specified file\n"); 
 } 
-void deadlock_detection() { 
-	second_passed = shm_clock[0];
-	FILE* fptr = fopen(filename, "a+");
-   	if (fptr == NULL) {
-		perror("Error opening and appending to the file");
-		terminate();
-    }
-	// Print values in resource vector
-    int num_resources = 10;
-    int num_processes = total_launched;
-
-   	char *deadlock_detect_msg = "Master running deadlock detection at time %u:%u\n";
-   	lfprintf(fptr, deadlock_detect_msg, shm_clock[0], shm_clock[1]);
-    printf(deadlock_detect_msg, shm_clock[0], shm_clock[1]);
-
-    // Check for available resources and grant child resource if available 
-		for (int i = 0; i < num_processes; i++) {
-			for (int j = 0; j < num_processes; j++) { 
-				if (requestMatrix[j][i] == 1 && allResources[j] != 20) { 
-					allResources[j] += 1; 
-					requestMatrix[j][i] = 0; 
-					allocatedMatrix[j][i] += 1; 
-					processTable[i].awaitingResponse = 0; 
-				
-					char *grant_and_removal_msg = "Master detected resource R%d is available, now granting it to process P%d\n     Master removing process P%d from wait queue at time %u:%u\n"; 
-					lfprintf(fptr, grant_and_removal_msg, j, i, i, shm_clock[0], shm_clock[1]); 
-					printf(grant_and_removal_msg, j, i, i, shm_clock[0], shm_clock[1]); 
 			
-					// Send resource message back to child in wait queue 
-					buf.mtype = processTable[i].pid; 
-					if (msgsnd(msqid, &buf, sizeof(msgbuffer) - sizeof(long), 0) == -1) { 
-						perror("msgsnd to child failed\n"); 
-						terminate(); 
-					}
-				break; 
-				}
-			}
-		}
-		
-		// Find child with least amount of time in the system or the most recent child 
-		int deadlocked_count = 0; 
-		int least_active_PID = 0; 
-		for (int i = 0; i < num_processes; i++) { 
-			for (int j = 0; j < num_resources; j++) { 
-				if (requestMatrix[j][i] == 1) { 
-					// Update last child that was potentially deadlocked 
-					least_active_PID = i; 
-					deadlocked_count += 1; 
-				}
-			}
-		} 
-
-		// If there are more than 1 processes waiting for a resource, remove 
-		if (deadlocked_count > 1) { 
-			printf("Processes "); 
-			lfprintf(fptr, "Processes "); 
-			for (int i = 0; i < total_launched; i++) { 
-				for (int j = 0; j < 10; j++) { 
-					if (requestMatrix[j][i] == 1) { 
-						lfprintf(fptr, "P%d ", i); 
-						printf("P%d ", i); 
-					}
-				}
-			}
-
-			printf("are deadlocked.\nMaster terminating P%d to remove deadlock\n", least_active_PID); 
-			lfprintf(fptr, "are deadlocked.\nMaster terminating P%d to remove deadlock\n", least_active_PID);
-
-			// Terminate deadlocked process 
-			if (kill(processTable[least_active_PID].pid, SIGKILL) == -1) { 
-				perror("Kill error in parent"); 
-				terminate(); 
-			} else { 
-				int status; 
-				if (waitpid(processTable[least_active_PID].pid, &status, 0) == -1) { 
-					perror("waitpid error in parent\n"); 
-					terminate(); 
-				} 
-			} 
-			
-			char *removal_msg = "Master terminated Process P%d \nReleasing process P%d resources: "; 
-			lfprintf(fptr, removal_msg, least_active_PID, least_active_PID); 
-			printf(removal_msg, least_active_PID, least_active_PID);
-
-			for (int t = 0; t <10; t++) { 
-				if (allocatedMatrix[t][least_active_PID] > 0) { 
-					lfprintf(fptr, "R%d:%d ", t, allocatedMatrix[t][least_active_PID]); 
-					printf("R%d:%d ", t, allocatedMatrix[t][least_active_PID]); 
-					allResources[t] -= allocatedMatrix[t][least_active_PID]; 
-				} 
-			
-				requestMatrix[t][least_active_PID] = 0; 
-				allocatedMatrix[t][least_active_PID] = 0; 
-			} 
-
-			lfprintf(fptr, "\n\n"); 
-			printf("\n\n"); 
-		
-			processTable[least_active_PID].occupied = 0; 
-			processTable[least_active_PID].awaitingResponse = 0; 
-			total_terminated += 1; 
-		} else { 
-			char *no_deadlocks = "No deadlocks detected\n\n"; 
-			lfprintf(fptr, no_deadlocks); 
-			printf("%s", no_deadlocks); 
-		} 
-		
-		fclose(fptr); 
-		// Run the algorithm to check if it's gone: 
-		if (deadlocked_count > 1) { 
-			deadlock_detection(); 
-		} 
-
-} 
-			
-void displayResources() {
-    int num_resources = 10;
-    int num_processes = total_launched;
-
-    FILE* fptr = fopen(filename, "a+");
-    if (fptr == NULL) {
-        perror("Error opening file\n");
-        terminate();
-    }
-
-    // Print to the file
-    lfprintf(fptr, "Allocated Matrix:\n");
-    lfprintf(fptr, "Resources: %5s %5s %5s %5s %5s %5s %5s %5s %5s %5s %5s\n", "", "R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9");
-    for (int j = 0; j < num_processes; j++) {
-        lfprintf(fptr, "P%-5d ", j);
-        for (int i = 0; i < num_resources; i++) {
-            lfprintf(fptr, " %-5d", allocatedMatrix[i][j]);
-        }
-        lfprintf(fptr, "\n");
-    }
-
-    // Requested Table data
-    lfprintf(fptr, "\n");
-    lfprintf(fptr, "Requested Matrix:\n");
-    lfprintf(fptr, "Resources: %5s %5s %5s %5s %5s %5s %5s %5s %5s %5s %5s\n", "", "R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9");
-    for (int j = 0; j < num_processes; j++) {
-        lfprintf(fptr, "P%-5d ", j);
-        for (int i = 0; i < num_resources; i++) {
-            lfprintf(fptr, " %-5d", requestMatrix[i][j]);
-        }
-        lfprintf(fptr, "\n");
-    }
-    lfprintf(fptr, "\n");
-
-    // Output to the screen
-    printf("Allocated Matrix:\n");
-    printf("Resources: %5s %5s %5s %5s %5s %5s %5s %5s %5s %5s %5s\n", "", "R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9");
-    for (int j = 0; j < num_processes; j++) {
-        printf("P%-5d ", j);
-        for (int i = 0; i < num_resources; i++) {
-            printf(" %-5d", allocatedMatrix[i][j]);
-        }
-        printf("\n");
-    }
-
-    // Output to the screen - requested matrix
-    printf("\n");
-    printf("Requested Matrix:\n");
-    printf("Resources: %5s %5s %5s %5s %5s %5s %5s %5s %5s %5s %5s\n", "", "R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9");
-    for (int j = 0; j < num_processes; j++) {
-        printf("P%-5d ", j);
-        for (int i = 0; i < num_resources; i++) {
-            printf(" %-5d", requestMatrix[i][j]);
-        }
-        printf("\n");
-    }
-    printf("\n");
-    fclose(fptr);
-}
-
 void displayPCB() {
     FILE* fptr = fopen(filename, "a+");
     if (fptr == NULL) {
@@ -591,23 +607,52 @@ void displayPCB() {
     fclose(fptr);
 }
 
-// A function to dispatch a message to a child process 
-void dispatch_message(int targetPID) { 
-	// Send message and update awaiting response flag for child 
-	buf.mtype = processTable[targetPID].pid; 
-	if (msgsnd(msqid, &buf, sizeof(msgbuffer) - sizeof(long), 0) == -1) { 
-		perror("msgsnd to child failed\n"); 
+
+// Function to terminate all processes, clean the queues, and removed shared memory. In additional, clean up the memory statistics
+void terminate() {
+	// Output the final data
+	float memoryStats = 0; 
+	float faultStats = 0;
+	FILE* fptr = fopen(filename, "a+"); 
+	if (fptr == NULL) { 
+		perror("Error opening file in termination\n"); 
 		terminate(); 
 	} 
-	processTable[targetPID].awaitingResponse = 1; 
-} 
+	
+	// Determine the output statistics 
+	if (total_refs != 0 && shm_clock[0] != 0) { 
+		memoryStats = (float)total_refs / shm_clock[0]; 
+	} 
+	
+	if (total_page != 0 && total_refs != 0) {
+        faultStats = (float)(total_page) / (total_refs);
+    }
+	// Output statistics
+	
+	if (memoryStats == 0) { 
+		char* final_ref = "\nThe total number of memory accesses in the system is: %d\n"; 
+		lfprintf(fptr, final_ref, total_refs); 
+		printf(final_ref, total_refs); 
+	} else { 
+		char* per_sec = "\nThe memory accesses per second in the system is: %.1f\n"; 
+		lfprintf(fptr, per_sec, memoryStats); 
+		printf(per_sec, memoryStats); 
+	} 
+	
+	if (faultStats == 0) { 
+		char* final_fault = "\nThe number of page faults in the system was: %d\n"; 
+		lfprintf(fptr, final_fault, total_page); 
+		printf(final_fault, total_page); 
+	} else { 
+		char* page_per_sec = "\nThe number of page faults per memory access in the system is: %.1f\n"; 
+		lfprintf(fptr, page_per_sec, faultStats); 
+		printf(page_per_sec, faultStats); 
+	} 
+	
+	fclose(fptr); 
 
-
-void terminate() {
-    // Terminate all processes, clean msg queue and remove shared memory
-    kill(0, SIGTERM);
     msgctl(msqid, IPC_RMID, NULL);
     shmdt(shm_ptr);
     shmctl(shm_id, IPC_RMID, NULL);
-    exit(0);
+	kill(0, SIGTERM);
 }
